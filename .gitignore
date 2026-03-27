@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Build outputs
+build/
+dist/
+release/
+*.egg-info/
+
+# Local project data
+*.vcutproj
+*.log
+tmp_*.wav
+*.tar.bz2
+
+# Large local runtime assets; keep them on disk, but do not commit them.
+models/
+
+# Editor files
+.vscode/
+.idea/
