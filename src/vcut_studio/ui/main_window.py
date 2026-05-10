@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QStatusBar,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -34,12 +35,14 @@ from ..media import (
     probe_media,
     resolve_ffmpeg_path,
 )
+from ..ppt_io import import_presentation
 from ..providers.translation import TranslationRequest
 from ..providers.tts import tts_provider_display_name, tts_provider_runtime_status
 from ..runtime_assets import find_app_icon
 from ..settings import AppSettings
 from ..subtitles import SubtitleCueData, read_subtitle_file, write_subtitle_file
 from .dubbing_logic import apply_voice_to_segments, pick_voice_preview_text
+from .ppt_workspace import PptWorkspacePage
 from .pages import DubbingPage, ExportPage, SettingsPage, TimelinePage, TranslationPage
 from .workers import (
     AnalysisResult,
@@ -49,6 +52,10 @@ from .workers import (
     DubbingWorker,
     ExportResult,
     ExportWorker,
+    PptScriptDraftJobResult,
+    PptScriptGenerationWorker,
+    PptScriptTranslationJobResult,
+    PptScriptTranslationWorker,
     SourceProofreadWorker,
     TranslationJobResult,
     TranslationTestWorker,
@@ -74,6 +81,7 @@ class MainWindow(QMainWindow):
         self.timeline_page = TimelinePage()
         self.translation_page = TranslationPage()
         self.dubbing_page = DubbingPage()
+        self.ppt_workspace_page = PptWorkspacePage()
         self.export_page = ExportPage()
         self.settings_page = SettingsPage()
         self.analysis_busy = False
@@ -83,7 +91,14 @@ class MainWindow(QMainWindow):
         self.analysis_thread: QThread | None = None
         self.analysis_worker: AnalysisWorker | None = None
         self.translation_thread: QThread | None = None
-        self.translation_worker: TranslationWorker | TranslationTestWorker | SourceProofreadWorker | None = None
+        self.translation_worker: (
+            TranslationWorker
+            | TranslationTestWorker
+            | SourceProofreadWorker
+            | PptScriptGenerationWorker
+            | PptScriptTranslationWorker
+            | None
+        ) = None
         self.dubbing_thread: QThread | None = None
         self.dubbing_worker: DubbingWorker | VoicePreviewWorker | None = None
         self.export_thread: QThread | None = None
@@ -104,7 +119,10 @@ class MainWindow(QMainWindow):
             self.translation_page,
             self.dubbing_page,
         )
-        self.setCentralWidget(self.timeline_page)
+        self.workspace_stack = QStackedWidget()
+        self.workspace_stack.addWidget(self.timeline_page)
+        self.workspace_stack.addWidget(self.ppt_workspace_page)
+        self.setCentralWidget(self.workspace_stack)
         self.setStatusBar(QStatusBar())
         self._build_status_controls()
 
@@ -415,6 +433,7 @@ class MainWindow(QMainWindow):
         self.translation_page.chinese_text_edited.connect(self.update_segment_chinese_text)
         self.translation_page.english_text_edited.connect(self.update_segment_english_text)
         self.translation_page.selection_changed.connect(self._refresh_interactive_state)
+        self.translation_page.time_double_clicked.connect(self.preview_translation_time)
         self.translation_page.translate_all_button.clicked.connect(self.translate_all_segments)
         self.translation_page.translate_selected_button.clicked.connect(self.translate_selected_segments)
         self.translation_page.proofread_source_requested.connect(self.proofread_source_segments)
@@ -544,7 +563,7 @@ class MainWindow(QMainWindow):
     def _update_window_title(self) -> None:
         project_name = self.context.current_project.name or "未命名项目"
         dirty_suffix = " *" if self.context.project_dirty else ""
-        self.setWindowTitle(f"VCut Studio - {project_name}{dirty_suffix}")
+        self.setWindowTitle(f"片语 - {project_name}{dirty_suffix}")
 
     def _set_task_progress(self, progress: int, message: str, *, pump_events: bool = False) -> None:
         clamped = max(0, min(int(progress), 100))
@@ -969,7 +988,7 @@ class MainWindow(QMainWindow):
             self,
             "打开项目",
             workspace_dir,
-            "VCut Studio 项目 (*.vcutproj)",
+            "片语项目 (*.vcutproj)",
         )
         if not filename:
             return
@@ -999,7 +1018,7 @@ class MainWindow(QMainWindow):
             self,
             "项目另存为",
             str(suggested_path),
-            "VCut Studio 项目 (*.vcutproj)",
+            "片语项目 (*.vcutproj)",
         )
         if not filename:
             return False
@@ -1189,11 +1208,27 @@ class MainWindow(QMainWindow):
             )
             return
 
+        selected_voice = self.dubbing_page.current_voice_id()
+        if not selected_voice:
+            QMessageBox.information(
+                self,
+                "没有可用音色",
+                "当前没有选中的英文音色。",
+            )
+            return
+        updated_voice_count = apply_voice_to_segments(
+            self.context.current_project.segments,
+            active_rows,
+            selected_voice,
+            invalidate_segment_dub=None,
+        )
+        if updated_voice_count:
+            self._mark_project_dirty()
+
         self._active_dubbing_previous_statuses = {
             row_index: self.context.current_project.segments[row_index].tts_status
             for row_index in active_rows
         }
-        selected_voice = self.dubbing_page.current_voice_id()
         selected_rate = self.dubbing_page.rate_spin.value()
         job_settings = self._build_dubbing_job_settings(
             selected_voice=selected_voice,
@@ -1230,7 +1265,7 @@ class MainWindow(QMainWindow):
         self._set_active_background_worker(worker)
         self.dubbing_busy = True
         self._refresh_interactive_state()
-        self.statusBar().showMessage("已加入配音生成队列...", 0)
+        self.statusBar().showMessage("已自动应用当前音色，并加入配音生成队列...", 0)
         thread.start()
 
     def preview_selected_voice(self) -> None:
@@ -1831,6 +1866,22 @@ class MainWindow(QMainWindow):
         segment = segments[row]
         self.timeline_page.set_focus_range(segment.start_ms, segment.end_ms)
         self.seek_preview(segment.start_ms)
+
+    def preview_translation_time(self, row: int, column: int) -> None:
+        segments = self.context.current_project.segments
+        if not (0 <= row < len(segments)):
+            return
+        if not self.context.current_project.video_path:
+            self.statusBar().showMessage("当前项目还没有源视频，无法跳转预览。", 4000)
+            return
+        segment = segments[row]
+        position_ms = segment.start_ms if column == 1 else segment.end_ms
+        self.timeline_page.set_focus_range(segment.start_ms, segment.end_ms)
+        self.seek_preview(position_ms)
+        self.statusBar().showMessage(
+            f"已跳转到第 {row + 1} 个分段的{'开始' if column == 1 else '结束'}时间。",
+            3000,
+        )
 
     def update_segment_english_text(self, row: int, text: str) -> None:
         segments = self.context.current_project.segments

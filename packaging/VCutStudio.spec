@@ -17,6 +17,11 @@ if docs_root.exists():
     for doc_path in docs_root.glob("*.md"):
         datas.append((str(doc_path), "docs"))
 
+for icon_name in ("app_icon.svg", "app_icon.png", "app_icon.ico"):
+    icon_path = project_root / icon_name
+    if icon_path.exists():
+        datas.append((str(icon_path), "."))
+
 runtime_icon = os.environ.get("VCUT_RUNTIME_ICON", "").strip()
 if runtime_icon:
     runtime_icon_path = Path(runtime_icon)
@@ -76,7 +81,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="VCutStudio",
+    name="片语",
     icon=os.environ.get("VCUT_APP_ICON", None) or None,
     debug=False,
     bootloader_ignore_signals=False,
@@ -94,5 +99,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="VCutStudio",
+    name="片语",
 )

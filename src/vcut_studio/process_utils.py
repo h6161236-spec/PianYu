@@ -17,7 +17,13 @@ def subprocess_windowless_kwargs() -> dict[str, Any]:
     kwargs["startupinfo"] = startupinfo
 
     create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    below_normal_priority = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+    creationflags = 0
     if create_no_window:
-        kwargs["creationflags"] = create_no_window
+        creationflags |= create_no_window
+    if below_normal_priority:
+        creationflags |= below_normal_priority
+    if creationflags:
+        kwargs["creationflags"] = creationflags
 
     return kwargs

@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
+import unicodedata
 import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .media import resolve_ffmpeg_path
+from .media import probe_media, resolve_ffmpeg_path
 from .models import CutSuggestion, Project
 from .process_utils import subprocess_windowless_kwargs
 from .providers.tts import create_tts_provider
 from .project_store import sanitize_filename
 from .settings import AppSettings
+from .subtitles import SubtitleCueData, read_subtitle_file
 
 
 class ExportError(RuntimeError):
@@ -322,6 +325,8 @@ def _subtitle_text_for_segment(segment: object, subtitle_mode: str) -> str:
     if normalized_mode == "bilingual":
         lines = [line for line in (chinese_text, english_text) if line]
         return "\n".join(lines)
+    if normalized_mode == "zh":
+        return chinese_text
     return english_text
 
 
@@ -609,10 +614,382 @@ def ffmpeg_filter_path(path: str | Path) -> str:
     return value
 
 
-def subtitle_filter_expression(settings: AppSettings, srt_path: str | Path) -> str:
+_HEX_COLOR_PATTERN = re.compile(r"^#?(?:[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$")
+_DEFAULT_SUBTITLE_ENGLISH_COLOR = "#FFFFFF"
+_DEFAULT_SUBTITLE_CHINESE_COLOR = "#FFD966"
+_SUBTITLE_SAFE_MARGIN_X_PERCENT = 8.0
+_SUBTITLE_SAFE_MARGIN_Y_PERCENT = 6.0
+_SUBTITLE_FONT_REFERENCE_HEIGHT = 480.0
+
+
+def _normalize_subtitle_hex_color(value: str | None, fallback: str) -> str:
+    normalized = str(value or "").strip()
+    if _HEX_COLOR_PATTERN.fullmatch(normalized):
+        return f"#{normalized.lstrip('#').upper()}"
+    return fallback
+
+
+def _hex_color_to_ass(value: str) -> str:
+    normalized = value.upper().lstrip("#")
+    if len(normalized) == 6:
+        red = int(normalized[0:2], 16)
+        green = int(normalized[2:4], 16)
+        blue = int(normalized[4:6], 16)
+        alpha = 0
+    else:
+        alpha_value = int(normalized[0:2], 16)
+        red = int(normalized[2:4], 16)
+        green = int(normalized[4:6], 16)
+        blue = int(normalized[6:8], 16)
+        alpha = max(0, min(255, 255 - alpha_value))
+    return f"&H{alpha:02X}{blue:02X}{green:02X}{red:02X}"
+
+
+def _subtitle_ass_color(settings: AppSettings, subtitle_language: str) -> str:
+    export_settings = getattr(settings, "export", None)
+    if subtitle_language == "zh":
+        configured = getattr(export_settings, "subtitle_chinese_color", _DEFAULT_SUBTITLE_CHINESE_COLOR)
+        color_value = _normalize_subtitle_hex_color(configured, _DEFAULT_SUBTITLE_CHINESE_COLOR)
+    else:
+        configured = getattr(export_settings, "subtitle_english_color", _DEFAULT_SUBTITLE_ENGLISH_COLOR)
+        color_value = _normalize_subtitle_hex_color(configured, _DEFAULT_SUBTITLE_ENGLISH_COLOR)
+    return _hex_color_to_ass(color_value)
+
+
+def _subtitle_font_size_for_canvas(
+    configured_font_size: int,
+    *,
+    canvas_height: int,
+) -> int:
+    normalized_size = max(1, int(configured_font_size or 28))
+    normalized_height = max(1, int(canvas_height or 1080))
+    scaled_size = normalized_size * (normalized_height / _SUBTITLE_FONT_REFERENCE_HEIGHT)
+    return max(1, int(round(scaled_size)))
+
+
+def _subtitle_position_percent(settings: AppSettings, subtitle_language: str) -> tuple[float, float]:
+    export_settings = getattr(settings, "export", None)
+    if subtitle_language == "zh":
+        x_percent = getattr(export_settings, "subtitle_chinese_x_percent", 50.0)
+        y_percent = getattr(export_settings, "subtitle_chinese_y_percent", 82.0)
+    else:
+        x_percent = getattr(export_settings, "subtitle_english_x_percent", 50.0)
+        y_percent = getattr(export_settings, "subtitle_english_y_percent", 90.0)
+    try:
+        normalized_x = float(x_percent)
+    except (TypeError, ValueError):
+        normalized_x = 50.0
+    try:
+        normalized_y = float(y_percent)
+    except (TypeError, ValueError):
+        normalized_y = 90.0 if subtitle_language != "zh" else 82.0
+    return (
+        max(0.0, min(100.0, normalized_x)),
+        max(0.0, min(100.0, normalized_y)),
+    )
+
+
+def _subtitle_safe_area_enabled(settings: AppSettings) -> bool:
+    export_settings = getattr(settings, "export", None)
+    return bool(getattr(export_settings, "subtitle_safe_area_enabled", True))
+
+
+def _subtitle_position_pixels(
+    settings: AppSettings,
+    subtitle_language: str,
+    *,
+    play_res_x: int = 1920,
+    play_res_y: int = 1080,
+) -> tuple[int, int]:
+    x_percent, y_percent = _subtitle_position_percent(settings, subtitle_language)
+    if _subtitle_safe_area_enabled(settings):
+        x_percent = min(max(x_percent, _SUBTITLE_SAFE_MARGIN_X_PERCENT), 100.0 - _SUBTITLE_SAFE_MARGIN_X_PERCENT)
+        y_percent = min(max(y_percent, _SUBTITLE_SAFE_MARGIN_Y_PERCENT), 100.0 - _SUBTITLE_SAFE_MARGIN_Y_PERCENT)
+    return (
+        int(round(play_res_x * (x_percent / 100.0))),
+        int(round(play_res_y * (y_percent / 100.0))),
+    )
+
+
+def _ms_to_ass_timestamp(value_ms: int) -> str:
+    total_ms = max(0, int(value_ms))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1_000)
+    centiseconds = int(round(milliseconds / 10.0))
+    if centiseconds >= 100:
+        seconds += 1
+        centiseconds = 0
+    if seconds >= 60:
+        minutes += 1
+        seconds = 0
+    if minutes >= 60:
+        hours += 1
+        minutes = 0
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def _subtitle_char_width_units(character: str) -> float:
+    if not character:
+        return 0.0
+    if character.isspace():
+        return 0.35
+    if unicodedata.east_asian_width(character) in {"F", "W"}:
+        return 1.0
+    if character in ",.;:!?'\"`|/\\[](){}<>":
+        return 0.38
+    if character.isdigit():
+        return 0.56
+    return 0.62
+
+
+def _subtitle_wrap_capacity_units(
+    *,
+    play_res_x: int,
+    margin_x: int,
+    font_size: int,
+) -> float:
+    available_width = max(180.0, float(play_res_x - (margin_x * 2) - 40))
+    return max(8.0, available_width / max(10.0, float(font_size) * 0.92))
+
+
+def _subtitle_tokens_for_wrapping(text: str) -> list[str]:
+    tokens: list[str] = []
+    current_word = ""
+    for character in text:
+        if character.isspace():
+            if current_word:
+                tokens.append(current_word)
+                current_word = ""
+            tokens.append(character)
+            continue
+        if character.isascii() and (character.isalnum() or character in {"'", "-", "_"}):
+            current_word += character
+            continue
+        if current_word:
+            tokens.append(current_word)
+            current_word = ""
+        tokens.append(character)
+    if current_word:
+        tokens.append(current_word)
+    return tokens
+
+
+def _break_subtitle_token(token: str, max_units: float) -> list[str]:
+    if not token:
+        return []
+    parts: list[str] = []
+    current = ""
+    current_units = 0.0
+    for character in token:
+        char_units = _subtitle_char_width_units(character)
+        if current and current_units + char_units > max_units:
+            parts.append(current)
+            current = character
+            current_units = char_units
+            continue
+        current += character
+        current_units += char_units
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _wrap_subtitle_line(text: str, max_units: float) -> str:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ""
+
+    lines: list[str] = []
+    current_parts: list[str] = []
+    current_units = 0.0
+
+    def flush_current() -> None:
+        nonlocal current_parts, current_units
+        line_text = "".join(current_parts).strip()
+        if line_text:
+            lines.append(line_text)
+        current_parts = []
+        current_units = 0.0
+
+    for token in _subtitle_tokens_for_wrapping(normalized):
+        if token.isspace():
+            if current_parts:
+                current_parts.append(" ")
+                current_units += _subtitle_char_width_units(" ")
+            continue
+
+        token_units = sum(_subtitle_char_width_units(character) for character in token)
+        candidate_units = current_units + token_units
+        if current_parts and candidate_units > max_units:
+            flush_current()
+
+        if token_units > max_units:
+            broken_parts = _break_subtitle_token(token, max_units)
+            for index, broken_part in enumerate(broken_parts):
+                part_units = sum(_subtitle_char_width_units(character) for character in broken_part)
+                if current_parts and current_units + part_units > max_units:
+                    flush_current()
+                current_parts.append(broken_part)
+                current_units += part_units
+                if index < len(broken_parts) - 1:
+                    flush_current()
+            continue
+
+        current_parts.append(token)
+        current_units += token_units
+
+    flush_current()
+    return "\n".join(lines)
+
+
+def _wrap_subtitle_text_for_ass(
+    text: str,
+    *,
+    play_res_x: int,
+    margin_x: int,
+    font_size: int,
+) -> str:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    max_units = _subtitle_wrap_capacity_units(
+        play_res_x=play_res_x,
+        margin_x=margin_x,
+        font_size=font_size,
+    )
+    wrapped_lines: list[str] = []
+    for raw_line in normalized.split("\n"):
+        wrapped = _wrap_subtitle_line(raw_line, max_units)
+        if wrapped:
+            wrapped_lines.extend(line for line in wrapped.split("\n") if line.strip())
+    return "\n".join(wrapped_lines)
+
+
+def _escape_ass_text(text: str) -> str:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\\", r"\\")
+    normalized = normalized.replace("{", r"\{").replace("}", r"\}")
+    return normalized.replace("\n", r"\N")
+
+
+def write_ass_subtitle_file(
+    cues: list[SubtitleCueData],
+    output_path: str | Path,
+    *,
+    settings: AppSettings,
+    subtitle_language: str,
+    play_res_x: int = 1920,
+    play_res_y: int = 1080,
+) -> Path:
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    play_res_x = max(1, int(play_res_x or 1920))
+    play_res_y = max(1, int(play_res_y or 1080))
+    font_size = _subtitle_font_size_for_canvas(
+        int(getattr(settings.export, "subtitle_font_size", 28) or 28),
+        canvas_height=play_res_y,
+    )
+    position_x, position_y = _subtitle_position_pixels(
+        settings,
+        subtitle_language,
+        play_res_x=play_res_x,
+        play_res_y=play_res_y,
+    )
+    margin_x = max(32, int(round(play_res_x * 0.08)))
+
+    header_lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        f"PlayResX: {play_res_x}",
+        f"PlayResY: {play_res_y}",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Default,Arial,"
+        f"{font_size},{_subtitle_ass_color(settings, subtitle_language)},{_subtitle_ass_color(settings, subtitle_language)},"
+        "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1.2,0,5,"
+        f"{margin_x},{margin_x},24,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    event_lines = []
+    for cue in cues:
+        wrapped_text = _wrap_subtitle_text_for_ass(
+            cue.text,
+            play_res_x=play_res_x,
+            margin_x=margin_x,
+            font_size=font_size,
+        )
+        escaped_text = _escape_ass_text(wrapped_text)
+        event_lines.append(
+            "Dialogue: 0,"
+            f"{_ms_to_ass_timestamp(cue.start_ms)},"
+            f"{_ms_to_ass_timestamp(cue.end_ms)},"
+            f"Default,,0,0,0,,{{\\an5\\pos({position_x},{position_y})}}{escaped_text}"
+        )
+
+    destination.write_text("\n".join(header_lines + event_lines) + "\n", encoding="utf-8")
+    return destination
+
+
+def _subtitle_filter_for_ass(ass_path: str | Path) -> str:
+    return f"subtitles='{ffmpeg_filter_path(ass_path)}'"
+
+
+def subtitle_filter_expression(
+    settings: AppSettings,
+    srt_path: str | Path,
+    *,
+    subtitle_language: str = "en",
+    margin_v: int | None = None,
+) -> str:
     filter_value = f"subtitles='{ffmpeg_filter_path(srt_path)}'"
     font_size = max(1, int(getattr(settings.export, "subtitle_font_size", 28) or 28))
-    return f"{filter_value}:force_style='FontSize={font_size}'"
+    style_fields = [
+        f"FontSize={font_size}",
+        "Alignment=2",
+        f"PrimaryColour={_subtitle_ass_color(settings, subtitle_language)}",
+        "Outline=0",
+        "Shadow=0",
+        "BorderStyle=1",
+        "OutlineColour=&H00000000",
+        "BackColour=&H00000000",
+    ]
+    if margin_v is not None:
+        style_fields.append(f"MarginV={max(0, int(margin_v))}")
+    return f"{filter_value}:force_style='{','.join(style_fields)}'"
+
+
+def bilingual_subtitle_filter_expression(
+    settings: AppSettings,
+    chinese_srt_path: str | Path,
+    english_srt_path: str | Path,
+) -> str:
+    font_size = max(1, int(getattr(settings.export, "subtitle_font_size", 28) or 28))
+    english_margin = max(18, int(round(font_size * 1.2)))
+    chinese_margin = english_margin + max(font_size + 8, int(round(font_size * 1.6)))
+    chinese_filter = subtitle_filter_expression(
+        settings,
+        chinese_srt_path,
+        subtitle_language="zh",
+        margin_v=chinese_margin,
+    )
+    english_filter = subtitle_filter_expression(
+        settings,
+        english_srt_path,
+        subtitle_language="en",
+        margin_v=english_margin,
+    )
+    return f"{chinese_filter},{english_filter}"
 
 
 def render_video_with_subtitles(
@@ -624,24 +1001,79 @@ def render_video_with_subtitles(
     burn_subtitles: bool,
     has_audio: bool,
     srt_path: str | Path,
+    subtitle_mode: str = "en",
+    chinese_srt_path: str | Path | None = None,
+    english_srt_path: str | Path | None = None,
     controller: object | None = None,
 ) -> Path:
     destination = Path(output_path)
     if burn_subtitles:
-        command = [
-            _effective_ffmpeg_path(settings),
-            "-y" if settings.media.overwrite_existing else "-n",
-            "-hide_banner",
-            "-i",
-            str(base_video_path),
-            "-vf",
-            subtitle_filter_expression(settings, srt_path),
-            "-c:v",
-            settings.media.video_codec,
-        ]
-        if has_audio:
-            command.extend(["-c:a", "copy"])
-        command.append(str(destination))
+        normalized_mode = str(subtitle_mode or "en").strip().lower()
+        play_res_x = 1920
+        play_res_y = 1080
+        try:
+            probe_result = probe_media(base_video_path, settings.media.ffmpeg_path)
+            if probe_result.media_info.width > 0 and probe_result.media_info.height > 0:
+                play_res_x = probe_result.media_info.width
+                play_res_y = probe_result.media_info.height
+        except Exception:
+            pass
+        with tempfile.TemporaryDirectory(prefix="vcut_ass_subtitles_") as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            subtitle_filter = ""
+            if (
+                normalized_mode == "bilingual"
+                and chinese_srt_path is not None
+                and english_srt_path is not None
+            ):
+                chinese_ass_path = write_ass_subtitle_file(
+                    read_subtitle_file(chinese_srt_path),
+                    temp_dir / "subtitle_zh.ass",
+                    settings=settings,
+                    subtitle_language="zh",
+                    play_res_x=play_res_x,
+                    play_res_y=play_res_y,
+                )
+                english_ass_path = write_ass_subtitle_file(
+                    read_subtitle_file(english_srt_path),
+                    temp_dir / "subtitle_en.ass",
+                    settings=settings,
+                    subtitle_language="en",
+                    play_res_x=play_res_x,
+                    play_res_y=play_res_y,
+                )
+                subtitle_filter = ",".join(
+                    [
+                        _subtitle_filter_for_ass(chinese_ass_path),
+                        _subtitle_filter_for_ass(english_ass_path),
+                    ]
+                )
+            else:
+                subtitle_language = "zh" if normalized_mode == "zh" else "en"
+                ass_path = write_ass_subtitle_file(
+                    read_subtitle_file(srt_path),
+                    temp_dir / f"subtitle_{subtitle_language}.ass",
+                    settings=settings,
+                    subtitle_language=subtitle_language,
+                    play_res_x=play_res_x,
+                    play_res_y=play_res_y,
+                )
+                subtitle_filter = _subtitle_filter_for_ass(ass_path)
+            command = [
+                _effective_ffmpeg_path(settings),
+                "-y" if settings.media.overwrite_existing else "-n",
+                "-hide_banner",
+                "-i",
+                str(base_video_path),
+                "-vf",
+                subtitle_filter,
+                "-c:v",
+                settings.media.video_codec,
+            ]
+            if has_audio:
+                command.extend(["-c:a", "copy"])
+            command.append(str(destination))
+            _run_command(command, "Subtitle export failed.", controller=controller)
     else:
         command = [
             _effective_ffmpeg_path(settings),
@@ -667,7 +1099,7 @@ def render_video_with_subtitles(
         if has_audio:
             command.extend(["-c:a", "copy"])
         command.extend(["-c:s", subtitle_codec_for_container(container), str(destination)])
-    _run_command(command, "Subtitle export failed.", controller=controller)
+        _run_command(command, "Subtitle export failed.", controller=controller)
     return destination
 
 
@@ -863,6 +1295,15 @@ def export_english_subtitle_video(
     with tempfile.TemporaryDirectory(prefix="vcut_subtitle_") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         srt_path = write_srt(subtitle_cues, temp_dir / "english_subtitles.srt")
+        chinese_srt_path: Path | None = None
+        english_srt_path: Path | None = None
+        normalized_subtitle_mode = str(subtitle_mode or "en").strip().lower()
+        if burn_subtitles and normalized_subtitle_mode == "bilingual":
+            chinese_cues = build_subtitle_cues(project, plan.keep_ranges, subtitle_mode="zh")
+            english_cues = build_subtitle_cues(project, plan.keep_ranges, subtitle_mode="en")
+            if chinese_cues and english_cues:
+                chinese_srt_path = write_srt(chinese_cues, temp_dir / "chinese_subtitles.srt")
+                english_srt_path = write_srt(english_cues, temp_dir / "english_only_subtitles.srt")
 
         base_video_path = Path(project.video_path)
         if plan.cut_ranges:
@@ -885,6 +1326,9 @@ def export_english_subtitle_video(
             burn_subtitles=burn_subtitles,
             has_audio=project.media_info.has_audio,
             srt_path=srt_path,
+            subtitle_mode=subtitle_mode,
+            chinese_srt_path=chinese_srt_path,
+            english_srt_path=english_srt_path,
             controller=controller,
         )
 
@@ -1158,6 +1602,15 @@ def export_english_dub_video(
             if not subtitle_cues:
                 raise ExportError("No English subtitle text is available. Add translated English text before exporting.")
             srt_path = write_srt(subtitle_cues, temp_dir / "english_dub_subtitles.srt")
+            chinese_srt_path: Path | None = None
+            english_srt_path: Path | None = None
+            normalized_subtitle_mode = str(subtitle_mode or "en").strip().lower()
+            if burn_subtitles and normalized_subtitle_mode == "bilingual":
+                chinese_cues = build_subtitle_cues_from_dub_cues(project, stretched_dub_cues, subtitle_mode="zh")
+                english_cues = build_subtitle_cues_from_dub_cues(project, stretched_dub_cues, subtitle_mode="en")
+                if chinese_cues and english_cues:
+                    chinese_srt_path = write_srt(chinese_cues, temp_dir / "chinese_dub_subtitles.srt")
+                    english_srt_path = write_srt(english_cues, temp_dir / "english_dub_only_subtitles.srt")
             _notify_progress(progress_callback, 95, "正在封装英文配音字幕视频...")
             render_video_with_subtitles(
                 dubbed_video_path,
@@ -1167,6 +1620,9 @@ def export_english_dub_video(
                 burn_subtitles=burn_subtitles,
                 has_audio=True,
                 srt_path=srt_path,
+                subtitle_mode=subtitle_mode,
+                chinese_srt_path=chinese_srt_path,
+                english_srt_path=english_srt_path,
                 controller=controller,
             )
             if export_sidecar_srt:

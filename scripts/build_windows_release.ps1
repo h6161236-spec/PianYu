@@ -9,6 +9,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$AppBundleName = [string]::Concat([char]0x7247, [char]0x8BED)
+$AppExecutableName = "$AppBundleName.exe"
+$ReleaseArchivePrefix = "$AppBundleName-windows-v"
+
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
 
@@ -295,7 +299,7 @@ function Write-PortableSettings {
     $portableSettings = [ordered]@{}
 
     if ($CurrentSettings.asr) {
-        $resolvedAsrModelDir = if ($RelativeModelDir) { $RelativeModelDir } else { [string]$CurrentSettings.asr.local_model_dir }
+        $resolvedAsrModelDir = if ($RelativeModelDir) { $RelativeModelDir } else { "" }
         $portableSettings["asr"] = [ordered]@{
             model_name        = [string]$CurrentSettings.asr.model_name
             device            = [string]$CurrentSettings.asr.device
@@ -303,9 +307,9 @@ function Write-PortableSettings {
             vad_enabled       = [bool]$CurrentSettings.asr.vad_enabled
             segment_max_seconds = [int]$CurrentSettings.asr.segment_max_seconds
             min_confidence    = [double]$CurrentSettings.asr.min_confidence
-            model_cache_dir   = if ($RelativeModelDir) { "" } else { [string]$CurrentSettings.asr.model_cache_dir }
+            model_cache_dir   = ""
             local_model_dir   = $resolvedAsrModelDir
-            local_files_only  = if ($RelativeModelDir) { $true } else { [bool]$CurrentSettings.asr.local_files_only }
+            local_files_only  = if ($RelativeModelDir) { $true } else { $false }
         }
     }
 
@@ -327,16 +331,38 @@ function Write-PortableSettings {
         }
     }
 
-    $ttsProviderType = if ($ForceLocalKokoroTts) { "kokoro_local" } elseif ($CurrentSettings.tts) { [string]$CurrentSettings.tts.provider_type } else { "builtin_voice_catalog" }
-    $ttsDefaultVoice = if ($ForceLocalKokoroTts) { "af_bella" } elseif ($CurrentSettings.tts) { [string]$CurrentSettings.tts.default_voice } else { "emma_clear" }
+    $bundledTtsRoot = Join-Path $RepoRoot "models\tts"
+    $hasBundledMelo = Test-Path (Join-Path $bundledTtsRoot "vits-melo-tts-zh_en\model.onnx")
+    $englishProviderType = if ($ForceLocalKokoroTts) { "kokoro_local" } elseif ($CurrentSettings.tts) { [string]$CurrentSettings.tts.english_provider_type } else { "builtin_voice_catalog" }
+    if (-not $englishProviderType) {
+        $englishProviderType = if ($ForceLocalKokoroTts) { "kokoro_local" } elseif ($CurrentSettings.tts) { [string]$CurrentSettings.tts.provider_type } else { "builtin_voice_catalog" }
+    }
+    $englishDefaultVoice = if ($ForceLocalKokoroTts) { "af_bella" } elseif ($CurrentSettings.tts) { [string]$CurrentSettings.tts.english_default_voice } else { "emma_clear" }
+    if (-not $englishDefaultVoice) {
+        $englishDefaultVoice = if ($ForceLocalKokoroTts) { "af_bella" } elseif ($CurrentSettings.tts) { [string]$CurrentSettings.tts.default_voice } else { "emma_clear" }
+    }
+    $chineseProviderType = if ($hasBundledMelo) { "melo_local" } elseif ($CurrentSettings.tts) { [string]$CurrentSettings.tts.chinese_provider_type } else { "builtin_voice_catalog" }
+    if (-not $chineseProviderType) {
+        $chineseProviderType = if ($hasBundledMelo) { "melo_local" } else { "builtin_voice_catalog" }
+    }
+    $chineseDefaultVoice = if ($hasBundledMelo) { "melo_zh_female" } elseif ($CurrentSettings.tts) { [string]$CurrentSettings.tts.chinese_default_voice } else { "" }
+    if (-not $chineseDefaultVoice -and $hasBundledMelo) {
+        $chineseDefaultVoice = "melo_zh_female"
+    }
     $portableSettings["tts"] = [ordered]@{
-        provider_type = $ttsProviderType
-        default_voice = $ttsDefaultVoice
-        rate          = if ($CurrentSettings.tts) { [double]$CurrentSettings.tts.rate } else { 1.0 }
-        volume        = if ($CurrentSettings.tts) { [double]$CurrentSettings.tts.volume } else { 1.0 }
-        sample_rate   = if ($CurrentSettings.tts) { [int]$CurrentSettings.tts.sample_rate } else { 22050 }
-        retry_count   = if ($CurrentSettings.tts) { [int]$CurrentSettings.tts.retry_count } else { 2 }
-        preview_text  = if ($CurrentSettings.tts) { [string]$CurrentSettings.tts.preview_text } else { "Welcome to VCut Studio. This is a sample English dubbing preview." }
+        provider_type          = $englishProviderType
+        default_voice          = $englishDefaultVoice
+        rate                   = if ($CurrentSettings.tts) { [double]$CurrentSettings.tts.rate } else { 1.0 }
+        volume                 = if ($CurrentSettings.tts) { [double]$CurrentSettings.tts.volume } else { 1.0 }
+        sample_rate            = if ($CurrentSettings.tts) { [int]$CurrentSettings.tts.sample_rate } else { 22050 }
+        retry_count            = if ($CurrentSettings.tts) { [int]$CurrentSettings.tts.retry_count } else { 2 }
+        preview_text           = if ($CurrentSettings.tts) { [string]$CurrentSettings.tts.preview_text } else { "This is a sample English dubbing preview." }
+        english_provider_type  = $englishProviderType
+        english_default_voice  = $englishDefaultVoice
+        english_preview_text   = if ($CurrentSettings.tts) { [string]$CurrentSettings.tts.english_preview_text } else { "This is a sample English dubbing preview." }
+        chinese_provider_type  = $chineseProviderType
+        chinese_default_voice  = $chineseDefaultVoice
+        chinese_preview_text   = if ($CurrentSettings.tts) { [string]$CurrentSettings.tts.chinese_preview_text } else { [string]::Concat([char]0x8FD9, [char]0x662F, [char]0x4E00, [char]0x6BB5, [char]0x4E2D, [char]0x6587, [char]0x914D, [char]0x97F3, [char]0x8BD5, [char]0x542C, [char]0x6587, [char]0x672C, [char]0x3002) }
     }
 
     $json = $portableSettings | ConvertTo-Json -Depth 6
@@ -405,8 +431,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed."
 }
 
-$distDir = Join-Path $RepoRoot "dist\VCutStudio"
-$exePath = Join-Path $distDir "VCutStudio.exe"
+$distDir = Join-Path $RepoRoot ("dist\" + $AppBundleName)
+$exePath = Join-Path $distDir $AppExecutableName
 if (-not (Test-Path $exePath)) {
     throw "Build finished but the executable was not found: $exePath"
 }
@@ -471,6 +497,12 @@ if ($bundledTtsPlan) {
     }
     New-Item -ItemType Directory -Force -Path $targetTtsRoot | Out-Null
     Copy-Item (Join-Path $bundledTtsPlan.RootPath "*") $targetTtsRoot -Recurse -Force
+    Get-ChildItem $targetTtsRoot -Recurse -File |
+        Where-Object {
+            $_.Name.EndsWith(".tar.bz2", [System.StringComparison]::OrdinalIgnoreCase) -or
+            $_.Extension -in @(".zip", ".7z", ".tar", ".gz", ".bz2", ".xz")
+        } |
+        Remove-Item -Force
     Write-Host "Bundled offline TTS assets: $($bundledTtsPlan.RootPath)"
 }
 else {
@@ -491,7 +523,7 @@ Write-Host "Release directory created: $distDir"
 if (-not $SkipZip) {
     $releaseDir = Join-Path $RepoRoot "release"
     New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-    $zipPath = Join-Path $releaseDir "VCutStudio-windows-v$releaseVersion.zip"
+    $zipPath = Join-Path $releaseDir ($ReleaseArchivePrefix + $releaseVersion + ".zip")
     $zipSucceeded = $false
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         if (Test-Path $zipPath) {

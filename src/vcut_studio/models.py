@@ -211,35 +211,100 @@ class ExportJob:
 
 
 @dataclass(slots=True)
+class SlidePage:
+    slide_id: str
+    slide_index: int
+    title: str = ""
+    source_text: str = ""
+    notes_text: str = ""
+    preview_image_path: str = ""
+    zh_script: str = ""
+    en_script: str = ""
+    estimated_duration_ms: int = 0
+    actual_tts_duration_ms: int = 0
+    translation_status: str = "pending"
+    tts_status: str = "pending"
+    voice_id: str | None = None
+    tts_audio_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "slide_id": self.slide_id,
+            "slide_index": self.slide_index,
+            "title": self.title,
+            "source_text": self.source_text,
+            "notes_text": self.notes_text,
+            "preview_image_path": self.preview_image_path,
+            "zh_script": self.zh_script,
+            "en_script": self.en_script,
+            "estimated_duration_ms": self.estimated_duration_ms,
+            "actual_tts_duration_ms": self.actual_tts_duration_ms,
+            "translation_status": self.translation_status,
+            "tts_status": self.tts_status,
+            "voice_id": self.voice_id,
+            "tts_audio_path": self.tts_audio_path,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SlidePage":
+        return cls(
+            slide_id=str(data.get("slide_id", uuid4().hex)),
+            slide_index=int(data.get("slide_index", 0)),
+            title=str(data.get("title", "")),
+            source_text=str(data.get("source_text", "")),
+            notes_text=str(data.get("notes_text", "")),
+            preview_image_path=str(data.get("preview_image_path", "")),
+            zh_script=str(data.get("zh_script", "")),
+            en_script=str(data.get("en_script", "")),
+            estimated_duration_ms=int(data.get("estimated_duration_ms", 0)),
+            actual_tts_duration_ms=int(data.get("actual_tts_duration_ms", 0)),
+            translation_status=str(data.get("translation_status", "pending")),
+            tts_status=str(data.get("tts_status", "pending")),
+            voice_id=data.get("voice_id"),
+            tts_audio_path=data.get("tts_audio_path"),
+        )
+
+
+@dataclass(slots=True)
 class Project:
     project_id: str
     name: str
+    project_kind: str = "video"
     video_path: str = ""
     audio_path: str = ""
+    source_ppt_path: str = ""
+    rendered_slides_dir: str = ""
+    deck_summary: str = ""
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
     source_duration_ms: int = 0
     analysis_completed: bool = False
     media_info: MediaInfo = field(default_factory=MediaInfo)
+    slides: list[SlidePage] = field(default_factory=list)
     segments: list[Segment] = field(default_factory=list)
     cut_suggestions: list[CutSuggestion] = field(default_factory=list)
     exports: list[ExportJob] = field(default_factory=list)
 
     @classmethod
-    def new(cls, name: str) -> "Project":
-        return cls(project_id=uuid4().hex, name=name)
+    def new(cls, name: str, *, project_kind: str = "video") -> "Project":
+        return cls(project_id=uuid4().hex, name=name, project_kind=project_kind)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "project_id": self.project_id,
             "name": self.name,
+            "project_kind": self.project_kind,
             "video_path": self.video_path,
             "audio_path": self.audio_path,
+            "source_ppt_path": self.source_ppt_path,
+            "rendered_slides_dir": self.rendered_slides_dir,
+            "deck_summary": self.deck_summary,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "source_duration_ms": self.source_duration_ms,
             "analysis_completed": self.analysis_completed,
             "media_info": self.media_info.to_dict(),
+            "slides": [slide.to_dict() for slide in self.slides],
             "segments": [segment.to_dict() for segment in self.segments],
             "cut_suggestions": [suggestion.to_dict() for suggestion in self.cut_suggestions],
             "exports": [job.to_dict() for job in self.exports],
@@ -252,14 +317,19 @@ class Project:
         source_duration_ms = int(data.get("source_duration_ms", media_info.duration_ms))
         return cls(
             project_id=str(data.get("project_id", uuid4().hex)),
-            name=str(data.get("name", "Untitled Project")),
+            name=str(data.get("name", "未命名项目")),
+            project_kind=str(data.get("project_kind", "video")),
             video_path=str(data.get("video_path", "")),
             audio_path=str(data.get("audio_path", "")),
+            source_ppt_path=str(data.get("source_ppt_path", "")),
+            rendered_slides_dir=str(data.get("rendered_slides_dir", "")),
+            deck_summary=str(data.get("deck_summary", "")),
             created_at=str(data.get("created_at", utc_now_iso())),
             updated_at=str(data.get("updated_at", utc_now_iso())),
             source_duration_ms=source_duration_ms,
             analysis_completed=bool(data.get("analysis_completed", False)),
             media_info=media_info,
+            slides=[SlidePage.from_dict(item) for item in data.get("slides", [])],
             segments=[Segment.from_dict(item) for item in data.get("segments", [])],
             cut_suggestions=[CutSuggestion.from_dict(item) for item in data.get("cut_suggestions", [])],
             exports=[ExportJob.from_dict(item) for item in data.get("exports", [])],

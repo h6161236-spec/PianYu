@@ -41,6 +41,7 @@ def runtime_base_dirs() -> list[Path]:
 
 def find_app_icon() -> Path | None:
     preferred_names = (
+        "app_icon.svg",
         "app_icon.ico",
         "app_icon.png",
         "图标3.ico",
@@ -68,19 +69,124 @@ def _is_kokoro_model_dir(path: Path) -> bool:
     return all(candidate.exists() for candidate in required_paths)
 
 
-def find_kokoro_model_dir() -> Path | None:
-    search_patterns = (
-        "models/tts/kokoro-en-v0_19",
-        "models/tts/kokoro-*",
-        "tts/kokoro-en-v0_19",
-        "tts/kokoro-*",
+def _is_melo_model_dir(path: Path) -> bool:
+    required_paths = (
+        path / "model.onnx",
+        path / "lexicon.txt",
+        path / "tokens.txt",
+        path / "date.fst",
+        path / "number.fst",
+        path / "phone.fst",
+    )
+    return all(candidate.exists() for candidate in required_paths)
+
+
+def _kokoro_voice_language_hint(preferred_voice_id: str | None = None) -> str:
+    normalized_voice_id = str(preferred_voice_id or "").strip().lower()
+    if normalized_voice_id.startswith(("zf_", "zm_")):
+        return "zh"
+    if normalized_voice_id.startswith(("af_", "am_", "bf_", "bm_")):
+        return "en"
+    return ""
+
+
+_KOKORO_V1_1_ENGLISH_VOICE_IDS = {"af_maple", "af_sol", "bf_vale"}
+
+
+def _kokoro_preferred_model_names(
+    language: str = "",
+    preferred_voice_id: str | None = None,
+) -> tuple[str, ...]:
+    normalized_language = str(language or "").strip().lower()
+    normalized_voice_id = str(preferred_voice_id or "").strip().lower()
+    if normalized_voice_id in _KOKORO_V1_1_ENGLISH_VOICE_IDS:
+        return (
+            "csukuangfj-kokoro-multi-lang-v1_1",
+            "kokoro-multi-lang-v1_1",
+            "kokoro-multi-lang-v1_0",
+            "kokoro-en-v0_19",
+        )
+    if normalized_language == "zh":
+        return (
+            "csukuangfj-kokoro-multi-lang-v1_1",
+            "kokoro-multi-lang-v1_1",
+            "kokoro-multi-lang-v1_0",
+        )
+    if normalized_language == "en":
+        return (
+            "kokoro-multi-lang-v1_0",
+            "kokoro-en-v0_19",
+            "csukuangfj-kokoro-multi-lang-v1_1",
+            "kokoro-multi-lang-v1_1",
+        )
+    return (
+        "csukuangfj-kokoro-multi-lang-v1_1",
+        "kokoro-multi-lang-v1_1",
+        "kokoro-multi-lang-v1_0",
         "kokoro-en-v0_19",
+    )
+
+
+def _kokoro_search_patterns(
+    language: str = "",
+    preferred_voice_id: str | None = None,
+) -> tuple[str, ...]:
+    preferred_models = _kokoro_preferred_model_names(
+        language=language,
+        preferred_voice_id=preferred_voice_id,
+    )
+    expanded_patterns: list[str] = []
+    for model_name in preferred_models:
+        expanded_patterns.extend(
+            [
+                f"models/tts/{model_name}",
+                f"tts/{model_name}",
+                model_name,
+            ]
+        )
+    return tuple(expanded_patterns) + (
+        "models/tts/kokoro-*",
+        "tts/kokoro-*",
         "kokoro-*",
+    )
+
+
+def find_kokoro_model_dir(
+    language: str | None = None,
+    preferred_voice_id: str | None = None,
+) -> Path | None:
+    normalized_language = _kokoro_voice_language_hint(preferred_voice_id) or str(language or "").strip().lower()
+    search_patterns = _kokoro_search_patterns(
+        normalized_language,
+        preferred_voice_id=preferred_voice_id,
     )
     for base_dir in runtime_base_dirs():
         for pattern in search_patterns:
             for candidate in sorted(base_dir.glob(pattern)):
-                if candidate.is_dir() and _is_kokoro_model_dir(candidate):
+                if not candidate.is_dir() or not _is_kokoro_model_dir(candidate):
+                    continue
+                candidate_name = candidate.name.lower()
+                if normalized_language == "zh" and "multi-lang" not in candidate_name:
+                    continue
+                if normalized_language == "en" and "kokoro-en" not in candidate_name and "multi-lang" not in candidate_name:
+                    continue
+                return candidate
+    return None
+
+
+def find_melo_model_dir() -> Path | None:
+    search_patterns = (
+        "models/tts/vits-melo-tts-zh_en",
+        "tts/vits-melo-tts-zh_en",
+        "vits-melo-tts-zh_en",
+        "models/tts/*melo*zh_en*",
+        "tts/*melo*zh_en*",
+        "*melo*zh_en*",
+    )
+    for base_dir in runtime_base_dirs():
+        for pattern in search_patterns:
+            for candidate in sorted(base_dir.glob(pattern)):
+                if candidate.is_dir() and _is_melo_model_dir(candidate):
                     return candidate
     return None
 
@@ -103,6 +209,10 @@ def find_sherpa_onnx_tts_executable() -> Path | None:
 
 def kokoro_local_assets_available() -> bool:
     return find_kokoro_model_dir() is not None and find_sherpa_onnx_tts_executable() is not None
+
+
+def melo_local_assets_available() -> bool:
+    return find_melo_model_dir() is not None and find_sherpa_onnx_tts_executable() is not None
 
 
 def path_contains_non_ascii(value: str | Path) -> bool:

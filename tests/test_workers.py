@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import shutil
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
-from vcut_studio.models import Project
+from vcut_studio.exporting import ExportPlan
+from vcut_studio.models import Project, SlidePage
 from vcut_studio.providers.translation import (
     CorrectionResult,
     TranslationProviderError,
@@ -15,6 +19,7 @@ from vcut_studio.settings import AppSettings
 from vcut_studio.ui.workers import (
     BackgroundTaskCancelled,
     ControllableWorker,
+    PptExportWorker,
     SourceProofreadWorker,
     TranslationWorker,
 )
@@ -23,6 +28,12 @@ from vcut_studio.ui.workers import (
 class DummyWorker(ControllableWorker):
     def __init__(self) -> None:
         super().__init__("测试任务")
+
+
+def _workspace_temp_dir(prefix: str) -> Path:
+    path = Path.cwd() / ".test-artifacts" / f"{prefix}-{uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 class FakeProcess:
@@ -185,6 +196,64 @@ class SourceProofreadWorkerTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0][1].source_text, "校正-seg1")
         self.assertEqual(results[1][1].source_text, "校正-seg2")
+
+class PptExportWorkerTests(unittest.TestCase):
+    def test_ppt_export_worker_uses_project_snapshot_for_quick_export(self) -> None:
+        project = Project.new("Deck", project_kind="ppt")
+        project.slides = [
+            SlidePage(
+                slide_id="slide-001",
+                slide_index=1,
+                title="Intro",
+                preview_image_path="slide_001.png",
+                zh_script="中文稿",
+                en_script="English script",
+            )
+        ]
+        settings = AppSettings()
+        worker = PptExportWorker(
+            project=project,
+            settings=settings,
+            output_dir="exports",
+            output_container="mp4",
+            burn_subtitles=True,
+            export_sidecar_srt=False,
+            subtitle_mode="bilingual",
+            voiceover_language="zh",
+        )
+        finished_results: list[object] = []
+        worker.finished.connect(finished_results.append)
+
+        tmp_dir = _workspace_temp_dir("ppt-export-worker")
+        try:
+            output_path = tmp_dir / "deck.mp4"
+
+            def _fake_export(project: Project, **_kwargs: object) -> ExportPlan:
+                project.deck_summary = "snapshot only"
+                project.slides[0].zh_script = "快照中文稿"
+                project.slides[0].en_script = "Snapshot English"
+                project.slides[0].translation_status = "translated"
+                project.slides[0].tts_status = "completed"
+                project.slides[0].voice_id = "zm_yunxi"
+                project.slides[0].tts_audio_path = "tts/slide_001.wav"
+                project.slides[0].actual_tts_duration_ms = 2300
+                return ExportPlan(cut_ranges=[], keep_ranges=[], output_path=output_path)
+
+            with patch("vcut_studio.ui.workers.export_ppt_voiceover_video", side_effect=_fake_export):
+                worker.run()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual(project.deck_summary, "")
+        self.assertEqual(project.slides[0].zh_script, "中文稿")
+        self.assertEqual(project.slides[0].en_script, "English script")
+        self.assertEqual(project.slides[0].tts_status, "pending")
+        self.assertEqual(len(finished_results), 1)
+        result = finished_results[0]
+        self.assertEqual(result.plan.output_path, output_path)
+        self.assertIsNot(result.project_snapshot, project)
+        self.assertEqual(result.project_snapshot.deck_summary, "snapshot only")
+        self.assertEqual(result.project_snapshot.slides[0].voice_id, "zm_yunxi")
 
 
 if __name__ == "__main__":

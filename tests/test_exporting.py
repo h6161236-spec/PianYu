@@ -17,6 +17,7 @@ from vcut_studio.exporting import (
     build_stretched_dub_cues,
     build_subtitle_cues,
     build_subtitle_cues_from_dub_cues,
+    bilingual_subtitle_filter_expression,
     can_reuse_segment_dub,
     export_clean_video,
     export_english_dub_video,
@@ -24,10 +25,12 @@ from vcut_studio.exporting import (
     ffmpeg_filter_path,
     keep_ranges_from_cuts,
     subtitle_filter_expression,
+    write_ass_subtitle_file,
 )
 from vcut_studio.media import probe_media
 from vcut_studio.models import CutSuggestion, MediaInfo, Project, Segment
 from vcut_studio.settings import AppSettings
+from vcut_studio.subtitles import SubtitleCueData
 
 
 class ExportPlanningTests(unittest.TestCase):
@@ -198,8 +201,124 @@ class ExportPlanningTests(unittest.TestCase):
 
         self.assertEqual(
             expression,
-            f"subtitles='{ffmpeg_filter_path('demo subtitles.srt')}':force_style='FontSize=40'",
+            (
+                f"subtitles='{ffmpeg_filter_path('demo subtitles.srt')}':"
+                "force_style='FontSize=40,Alignment=2,PrimaryColour=&H00FFFFFF,"
+                "Outline=0,Shadow=0,BorderStyle=1,OutlineColour=&H00000000,BackColour=&H00000000'"
+            ),
         )
+
+    def test_subtitle_filter_expression_accepts_color_without_hash(self) -> None:
+        settings = AppSettings()
+        settings.export.subtitle_english_color = "047bff"
+
+        expression = subtitle_filter_expression(settings, "demo subtitles.srt")
+
+        self.assertIn("PrimaryColour=&H00FF7B04", expression)
+
+    def test_bilingual_subtitle_filter_expression_uses_separate_colors(self) -> None:
+        settings = AppSettings()
+        settings.export.subtitle_font_size = 30
+        settings.export.subtitle_chinese_color = "#FF0000"
+        settings.export.subtitle_english_color = "#00FF00"
+
+        expression = bilingual_subtitle_filter_expression(
+            settings,
+            "chinese.srt",
+            "english.srt",
+        )
+
+        self.assertEqual(
+            expression,
+            (
+                f"subtitles='{ffmpeg_filter_path('chinese.srt')}':"
+                "force_style='FontSize=30,Alignment=2,PrimaryColour=&H000000FF,"
+                "Outline=0,Shadow=0,BorderStyle=1,OutlineColour=&H00000000,BackColour=&H00000000,MarginV=84',"
+                f"subtitles='{ffmpeg_filter_path('english.srt')}':"
+                "force_style='FontSize=30,Alignment=2,PrimaryColour=&H0000FF00,"
+                "Outline=0,Shadow=0,BorderStyle=1,OutlineColour=&H00000000,BackColour=&H00000000,MarginV=36'"
+            ),
+        )
+
+    def test_write_ass_subtitle_file_uses_requested_resolution_and_font_size(self) -> None:
+        settings = AppSettings()
+        settings.export.subtitle_font_size = 36
+        settings.export.subtitle_english_x_percent = 40
+        settings.export.subtitle_english_y_percent = 75
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ass_path = write_ass_subtitle_file(
+                [
+                    SubtitleCueData(
+                        index=1,
+                        start_ms=0,
+                        end_ms=1000,
+                        text="Hello subtitle",
+                    )
+                ],
+                Path(tmp_dir) / "subtitle.ass",
+                settings=settings,
+                subtitle_language="en",
+                play_res_x=1280,
+                play_res_y=720,
+            )
+
+            ass_text = ass_path.read_text(encoding="utf-8")
+
+        self.assertIn("PlayResX: 1280", ass_text)
+        self.assertIn("PlayResY: 720", ass_text)
+        self.assertIn("Style: Default,Arial,54,", ass_text)
+        self.assertIn(r"{\an5\pos(512,540)}Hello subtitle", ass_text)
+
+    def test_write_ass_subtitle_file_wraps_long_english_lines(self) -> None:
+        settings = AppSettings()
+        settings.export.subtitle_font_size = 28
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ass_path = write_ass_subtitle_file(
+                [
+                    SubtitleCueData(
+                        index=1,
+                        start_ms=0,
+                        end_ms=1000,
+                        text="This is a very long English subtitle line that should wrap before it runs outside the video frame.",
+                    )
+                ],
+                Path(tmp_dir) / "subtitle_wrap_en.ass",
+                settings=settings,
+                subtitle_language="en",
+                play_res_x=640,
+                play_res_y=360,
+            )
+
+            ass_text = ass_path.read_text(encoding="utf-8")
+
+        self.assertIn(r"\N", ass_text)
+
+    def test_write_ass_subtitle_file_wraps_long_chinese_lines(self) -> None:
+        settings = AppSettings()
+        settings.export.subtitle_font_size = 28
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ass_path = write_ass_subtitle_file(
+                [
+                    SubtitleCueData(
+                        index=1,
+                        start_ms=0,
+                        end_ms=1000,
+                        text="这是一条特别长的中文字幕内容用于测试在导出视频的时候会不会自动换行避免超出画面范围。",
+                    )
+                ],
+                Path(tmp_dir) / "subtitle_wrap_zh.ass",
+                settings=settings,
+                subtitle_language="zh",
+                play_res_x=640,
+                play_res_y=360,
+            )
+
+            ass_text = ass_path.read_text(encoding="utf-8")
+
+        self.assertIn(r"\N", ass_text)
 
     def test_can_reuse_segment_dub_matches_cached_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

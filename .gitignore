@@ -9,12 +9,20 @@ build/
 dist/
 release/
 *.egg-info/
+.test-artifacts/
+tmp*/
 
 # Local project data
 *.vcutproj
 *.log
 tmp_*.wav
 *.tar.bz2
+*.mp4
+*.srt
+*.pptx
+*.PPTX
+voice_candidates/
+.codex/
 
 # Large local runtime assets; keep them on disk, but do not commit them.
 models/

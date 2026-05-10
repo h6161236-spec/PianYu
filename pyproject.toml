@@ -5,12 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vcut-studio"
 version = "0.1.0"
-description = "Windows desktop scaffold for video cleanup, subtitle translation, and English dubbing."
+description = "Windows desktop tool for importing PPT, generating bilingual voiceover scripts, and exporting narrated slide videos."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["PySide6>=6.8"]
+dependencies = [
+    "Pillow>=10.0",
+    "PySide6>=6.8",
+    "python-pptx>=1.0",
+]
 authors = [{ name = "OpenAI Codex" }]
-keywords = ["video", "desktop", "translation", "dubbing", "editing"]
+keywords = ["ppt", "desktop", "translation", "tts", "voiceover"]
 
 [project.optional-dependencies]
 asr = ["faster-whisper>=1.1", "opencc-python-reimplemented>=0.1.7"]

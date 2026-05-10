@@ -7,9 +7,11 @@ from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QColorDialog,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
@@ -53,6 +55,7 @@ from .dubbing_logic import (
     dub_review_status_label,
     segment_target_voice_id,
 )
+from .theme import theme_colors
 
 SEGMENT_REMOVED_COLOR = QColor("#2f2527")
 SEGMENT_TRIMMED_COLOR = QColor("#3a3423")
@@ -321,7 +324,7 @@ class HomePage(QWidget):
         layout = QVBoxLayout(self)
         layout.setSpacing(16)
 
-        title = QLabel("VCut Studio")
+        title = QLabel("片语")
         title.setStyleSheet("font-size: 28px; font-weight: 700;")
         subtitle = QLabel("Windows 桌面端视频工具，支持两条独立任务：删除停顿/语气词，以及中文视频翻译/英文配音。")
         subtitle.setWordWrap(True)
@@ -868,6 +871,7 @@ class TranslationPage(QWidget):
     chinese_text_edited = Signal(int, str)
     english_text_edited = Signal(int, str)
     selection_changed = Signal()
+    time_double_clicked = Signal(int, int)
     import_source_subtitle_requested = Signal()
     import_translation_subtitle_requested = Signal()
     export_subtitle_requested = Signal()
@@ -928,6 +932,7 @@ class TranslationPage(QWidget):
         )
         configure_resizable_columns(self.translation_table, [140, 120, 120, 420, 420])
         self.translation_table.cellChanged.connect(self._on_cell_changed)
+        self.translation_table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.translation_table.itemSelectionChanged.connect(self.selection_changed.emit)
         layout.addWidget(self.translation_table, stretch=1)
 
@@ -982,6 +987,10 @@ class TranslationPage(QWidget):
             self.chinese_text_edited.emit(row, item.text() if item else "")
         else:
             self.english_text_edited.emit(row, item.text() if item else "")
+
+    def _on_cell_double_clicked(self, row: int, column: int) -> None:
+        if column in {1, 2}:
+            self.time_double_clicked.emit(row, column)
 
     def selected_rows(self) -> list[int]:
         selection_model = self.translation_table.selectionModel()
@@ -1076,10 +1085,12 @@ class DubbingPage(QWidget):
         self.rate_spin.setSingleStep(0.05)
         top_row.addWidget(self.rate_spin)
         top_row.addStretch(1)
-        self.apply_voice_button = QPushButton("应用音色到勾选/所选片段")
-        self.generate_button = QPushButton("生成勾选/所选配音")
+        self.apply_voice_button = QPushButton("仅应用音色")
+        self.generate_button = QPushButton("生成配音（自动应用当前音色）")
         self.preview_button = QPushButton("试听音色")
         self.stop_button = QPushButton("停止播放")
+        self.apply_voice_button.setToolTip("只修改片段音色，不立即生成配音。")
+        self.generate_button.setToolTip("先把当前音色应用到勾选/所选片段，再直接生成配音。")
         top_row.addWidget(self.apply_voice_button)
         top_row.addWidget(self.generate_button)
         top_row.addWidget(self.preview_button)
@@ -1135,8 +1146,10 @@ class DubbingPage(QWidget):
                 voice.name for voice in installed_windows_voices() if voice.culture.lower().startswith("en")
             ]
             if len(english_voice_names) <= 1:
+                only_voice_name = english_voice_names[0] if english_voice_names else "当前系统音色"
                 voice_summary = (
-                    "当前系统仅检测到 1 个英文系统音色，预设音色主要是语速/风格预设，实际音色会比较接近。"
+                    f"当前系统仅检测到 1 个英文系统音色（{only_voice_name}），"
+                    "预设里的男声/女声主要影响语速和风格，实际音色不会明显变化。"
                 )
             else:
                 voice_summary = f"当前系统检测到 {len(english_voice_names)} 个英文系统音色。"
@@ -1232,7 +1245,7 @@ class DubbingPage(QWidget):
         self.uncheck_selected_button.setEnabled(not running)
         self.check_all_button.setEnabled(not running)
         self.uncheck_all_button.setEnabled(not running)
-        self.generate_button.setText("生成中..." if running else "生成勾选/所选配音")
+        self.generate_button.setText("生成中..." if running else "生成配音（自动应用当前音色）")
         self.dubbing_progress_bar.setVisible(running)
         if not running:
             self.dubbing_progress_bar.setValue(0)
@@ -1670,10 +1683,96 @@ class SettingsPage(QWidget):
         self.audio_lufs_target_spin = QSpinBox()
         self.audio_lufs_target_spin.setRange(-30, 0)
         self.export_subtitle_font_size_spin = QSpinBox()
-        self.export_subtitle_font_size_spin.setRange(8, 72)
+        self.export_subtitle_font_size_spin.setRange(5, 72)
         self.export_subtitle_font_size_spin.setSingleStep(2)
-        self.export_subtitle_font_size_spin.setSuffix(" px")
-        self.export_subtitle_font_size_spin.setToolTip("字幕大小，数字越大，烧录到视频里的字幕会越大。")
+        self.export_subtitle_font_size_spin.setSuffix(" 号")
+        self.export_subtitle_font_size_spin.setToolTip("字幕字号，数字越大，烧录到视频里的字幕会越大。")
+        self.export_subtitle_font_decrease_button = QPushButton("-")
+        self.export_subtitle_font_decrease_button.setFixedWidth(32)
+        self.export_subtitle_font_decrease_button.setToolTip("减小字幕字号")
+        self.export_subtitle_font_increase_button = QPushButton("+")
+        self.export_subtitle_font_increase_button.setFixedWidth(32)
+        self.export_subtitle_font_increase_button.setToolTip("增大字幕字号")
+        subtitle_font_size_row = build_inline_row(
+            self.export_subtitle_font_size_spin,
+            self.export_subtitle_font_decrease_button,
+            self.export_subtitle_font_increase_button,
+        )
+        self.export_subtitle_english_color_edit = QLineEdit()
+        self.export_subtitle_english_color_edit.setMaxLength(9)
+        self.export_subtitle_english_color_edit.setPlaceholderText("#FFFFFF")
+        self.export_subtitle_english_color_edit.setToolTip("英文字幕颜色，支持 #RRGGBB 或 #AARRGGBB。")
+        self.export_subtitle_english_color_button = QPushButton("色盘")
+        self.export_subtitle_english_color_button.setToolTip("打开色盘选择英文字幕颜色")
+        subtitle_english_color_row = build_inline_row(
+            self.export_subtitle_english_color_edit,
+            self.export_subtitle_english_color_button,
+        )
+        self.export_subtitle_chinese_color_edit = QLineEdit()
+        self.export_subtitle_chinese_color_edit.setMaxLength(9)
+        self.export_subtitle_chinese_color_edit.setPlaceholderText("#FFD966")
+        self.export_subtitle_chinese_color_edit.setToolTip("中文字幕颜色，支持 #RRGGBB 或 #AARRGGBB。")
+        self.export_subtitle_chinese_color_button = QPushButton("色盘")
+        self.export_subtitle_chinese_color_button.setToolTip("打开色盘选择中文字幕颜色")
+        subtitle_chinese_color_row = build_inline_row(
+            self.export_subtitle_chinese_color_edit,
+            self.export_subtitle_chinese_color_button,
+        )
+        self.export_subtitle_preview_hint = QLabel(
+            "实时预览当前字幕字号、颜色和中英双语叠放效果。预览区会始终同时显示中英文两行字幕。"
+        )
+        self.export_subtitle_preview_hint.setWordWrap(True)
+        self.export_subtitle_preview_surface = QFrame()
+        self.export_subtitle_preview_surface.setMinimumHeight(220)
+        preview_colors = theme_colors(
+            str((QApplication.instance().property("resolved_theme_mode") if QApplication.instance() is not None else "dark") or "dark"),
+            app=QApplication.instance(),
+        )
+        self.export_subtitle_preview_surface.setStyleSheet(
+            "QFrame {"
+            f"border: 1px solid {preview_colors.border};"
+            "border-radius: 12px;"
+            f"background: {preview_colors.video_surface};"
+            "}"
+        )
+        preview_layout = QVBoxLayout(self.export_subtitle_preview_surface)
+        preview_layout.setContentsMargins(18, 18, 18, 18)
+        preview_layout.setSpacing(10)
+        self.export_subtitle_preview_badge = QLabel("中英字幕预览")
+        self.export_subtitle_preview_badge.setStyleSheet(
+            "QLabel {"
+            "padding: 4px 10px;"
+            "border-radius: 999px;"
+            "background: rgba(15, 23, 42, 150);"
+            "color: #E2E8F0;"
+            "font-weight: 600;"
+            "}"
+        )
+        preview_layout.addWidget(self.export_subtitle_preview_badge, alignment=Qt.AlignmentFlag.AlignLeft)
+        preview_layout.addStretch(1)
+        self.export_subtitle_preview_block = QFrame()
+        self.export_subtitle_preview_block.setStyleSheet("QFrame { background: transparent; border: none; }")
+        subtitle_block_layout = QVBoxLayout(self.export_subtitle_preview_block)
+        subtitle_block_layout.setContentsMargins(12, 0, 12, 8)
+        subtitle_block_layout.setSpacing(4)
+        self.export_subtitle_preview_chinese_label = QLabel("这是一条中文字幕示例")
+        self.export_subtitle_preview_english_label = QLabel("This is a sample English subtitle.")
+        for label in (
+            self.export_subtitle_preview_chinese_label,
+            self.export_subtitle_preview_english_label,
+        ):
+            label.setWordWrap(True)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setStyleSheet("QLabel { background: transparent; border: none; font-weight: 600; }")
+            subtitle_block_layout.addWidget(label)
+        preview_layout.addWidget(self.export_subtitle_preview_block)
+        preview_group = self._build_form_group(
+            "字幕预览",
+            [
+                ("说明", self.export_subtitle_preview_hint),
+                ("预览", self.export_subtitle_preview_surface),
+            ],
+        )
         self.output_container_combo = QComboBox()
         self.output_container_combo.addItems(["mp4", "mov", "mkv"])
         export_group = self._build_form_group(
@@ -1681,13 +1780,27 @@ class SettingsPage(QWidget):
             [
                 ("默认导出类型", self.export_default_type_combo),
                 ("默认字幕模式", self.export_subtitle_mode_combo),
-                ("字幕大小", self.export_subtitle_font_size_spin),
+                ("字幕字号", subtitle_font_size_row),
+                ("英文字幕颜色", subtitle_english_color_row),
+                ("中文字幕颜色", subtitle_chinese_color_row),
                 ("目标响度", self.audio_lufs_target_spin),
                 ("输出容器", self.output_container_combo),
                 ("烧录字幕", self.export_burn_subtitles_checkbox),
                 ("导出 SRT", self.export_sidecar_srt_checkbox),
             ],
         )
+        self.export_subtitle_font_decrease_button.clicked.connect(self.export_subtitle_font_size_spin.stepDown)
+        self.export_subtitle_font_increase_button.clicked.connect(self.export_subtitle_font_size_spin.stepUp)
+        self.export_subtitle_english_color_button.clicked.connect(
+            lambda: self._pick_subtitle_color(self.export_subtitle_english_color_edit)
+        )
+        self.export_subtitle_chinese_color_button.clicked.connect(
+            lambda: self._pick_subtitle_color(self.export_subtitle_chinese_color_edit)
+        )
+        self.export_subtitle_mode_combo.currentIndexChanged.connect(self._refresh_export_subtitle_preview)
+        self.export_subtitle_font_size_spin.valueChanged.connect(self._refresh_export_subtitle_preview)
+        self.export_subtitle_english_color_edit.textChanged.connect(self._refresh_export_subtitle_preview)
+        self.export_subtitle_chinese_color_edit.textChanged.connect(self._refresh_export_subtitle_preview)
 
         self._add_settings_section(
             "常规",
@@ -1722,7 +1835,7 @@ class SettingsPage(QWidget):
         self._add_settings_section(
             "导出",
             "整理默认导出格式、字幕方式、响度目标和容器格式。",
-            [export_group],
+            [export_group, preview_group],
         )
 
         self.settings_nav.currentRowChanged.connect(self._set_current_settings_section)
@@ -1815,13 +1928,77 @@ class SettingsPage(QWidget):
                 voice.name for voice in installed_windows_voices() if voice.culture.lower().startswith("en")
             ]
             if english_voice_names:
-                self.tts_hint_label.setText(
-                    f"当前检测到 {len(english_voice_names)} 个英文系统音色。发布给别的电脑使用时，建议优先改用离线 Kokoro。"
-                )
+                if len(english_voice_names) == 1:
+                    self.tts_hint_label.setText(
+                        f"当前仅检测到 1 个英文系统音色（{english_voice_names[0]}）。"
+                        "即使切换男声/女声预设，实际音色仍会比较接近。发布给别的电脑使用时，建议优先改用离线 Kokoro。"
+                    )
+                else:
+                    self.tts_hint_label.setText(
+                        f"当前检测到 {len(english_voice_names)} 个英文系统音色。发布给别的电脑使用时，建议优先改用离线 Kokoro。"
+                    )
             else:
                 self.tts_hint_label.setText(
                     "当前没有检测到英文系统音色。如果要跨电脑稳定使用，建议改用离线 Kokoro。"
                 )
+
+    def _pick_subtitle_color(self, target_edit: QLineEdit) -> None:
+        current_text = target_edit.text().strip()
+        if current_text and not current_text.startswith("#"):
+            current_text = f"#{current_text}"
+        initial = QColor(current_text)
+        if not initial.isValid():
+            initial = QColor("#FFFFFF")
+        color = QColorDialog.getColor(
+            initial,
+            self,
+            "选择字幕颜色",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
+        if not color.isValid():
+            return
+        if color.alpha() >= 255:
+            target_edit.setText(f"#{color.red():02X}{color.green():02X}{color.blue():02X}")
+        else:
+            target_edit.setText(
+                f"#{color.alpha():02X}{color.red():02X}{color.green():02X}{color.blue():02X}"
+            )
+
+    def _subtitle_preview_color(self, value: str, fallback: str) -> QColor:
+        normalized = value.strip()
+        if normalized and not normalized.startswith("#"):
+            normalized = f"#{normalized}"
+        color = QColor(normalized)
+        if color.isValid():
+            return color
+        return QColor(fallback)
+
+    def _subtitle_preview_css(self, color: QColor) -> str:
+        return f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alpha()})"
+
+    def _refresh_export_subtitle_preview(self) -> None:
+        font_size = max(10, int(self.export_subtitle_font_size_spin.value()))
+        chinese_color = self._subtitle_preview_color(self.export_subtitle_chinese_color_edit.text(), "#FFD966")
+        english_color = self._subtitle_preview_color(self.export_subtitle_english_color_edit.text(), "#FFFFFF")
+
+        self.export_subtitle_preview_chinese_label.setStyleSheet(
+            "QLabel {"
+            "background: transparent;"
+            "border: none;"
+            f"color: {self._subtitle_preview_css(chinese_color)};"
+            f"font-size: {font_size}px;"
+            "font-weight: 700;"
+            "}"
+        )
+        self.export_subtitle_preview_english_label.setStyleSheet(
+            "QLabel {"
+            "background: transparent;"
+            "border: none;"
+            f"color: {self._subtitle_preview_css(english_color)};"
+            f"font-size: {font_size}px;"
+            "font-weight: 700;"
+            "}"
+        )
 
     def load_settings(self, settings: AppSettings) -> None:
         self.workspace_dir_edit.setText(settings.workspace.workspace_dir)
@@ -1887,10 +2064,17 @@ class SettingsPage(QWidget):
         set_combo_value(self.export_default_type_combo, settings.export.default_export_type)
         set_combo_value(self.export_subtitle_mode_combo, settings.export.subtitle_mode)
         self.export_subtitle_font_size_spin.setValue(settings.export.subtitle_font_size)
+        self.export_subtitle_english_color_edit.setText(
+            str(getattr(settings.export, "subtitle_english_color", "#FFFFFF"))
+        )
+        self.export_subtitle_chinese_color_edit.setText(
+            str(getattr(settings.export, "subtitle_chinese_color", "#FFD966"))
+        )
         self.export_burn_subtitles_checkbox.setChecked(settings.export.burn_subtitles)
         self.export_sidecar_srt_checkbox.setChecked(settings.export.export_sidecar_srt)
         self.audio_lufs_target_spin.setValue(settings.export.audio_lufs_target)
         set_combo_value(self.output_container_combo, settings.export.output_container)
+        self._refresh_export_subtitle_preview()
 
     def build_settings(self) -> AppSettings:
         raw_filler_words = self.filler_words_edit.toPlainText().replace("\n", ",")
@@ -1960,6 +2144,8 @@ class SettingsPage(QWidget):
                     "default_export_type": self.export_default_type_combo.currentData(),
                     "subtitle_mode": self.export_subtitle_mode_combo.currentData(),
                     "subtitle_font_size": self.export_subtitle_font_size_spin.value(),
+                    "subtitle_english_color": self.export_subtitle_english_color_edit.text().strip(),
+                    "subtitle_chinese_color": self.export_subtitle_chinese_color_edit.text().strip(),
                     "burn_subtitles": self.export_burn_subtitles_checkbox.isChecked(),
                     "export_sidecar_srt": self.export_sidecar_srt_checkbox.isChecked(),
                     "audio_lufs_target": self.audio_lufs_target_spin.value(),

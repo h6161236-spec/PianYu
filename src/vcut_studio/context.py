@@ -13,7 +13,9 @@ class AppContext:
     settings_store: SettingsStore
     project_store: ProjectStore
     settings: AppSettings
-    current_project: Project = field(default_factory=lambda: Project.new("Untitled Project"))
+    current_project: Project = field(
+        default_factory=lambda: Project.new("未命名演示", project_kind="ppt")
+    )
     current_project_path: Path | None = None
     project_dirty: bool = False
 
