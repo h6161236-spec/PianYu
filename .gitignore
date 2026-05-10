@@ -23,6 +23,7 @@ tmp_*.wav
 *.PPTX
 voice_candidates/
 .codex/
+图标代码.txt
 
 # Large local runtime assets; keep them on disk, but do not commit them.
 models/

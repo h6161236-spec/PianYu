@@ -426,7 +426,7 @@ Write-Host "Package version: $packageVersion"
 Write-Host "Release version: $releaseVersion"
 Write-Host "Release kind: $ReleaseKind"
 
-& $PythonExe -m PyInstaller --noconfirm --clean packaging\VCutStudio.spec --distpath dist --workpath build\pyinstaller
+& $PythonExe -m PyInstaller --noconfirm --clean packaging\PianYu.spec --distpath dist --workpath build\pyinstaller
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed."
 }
