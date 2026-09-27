@@ -14,9 +14,10 @@ from uuid import uuid4
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from ..asr import FasterWhisperTranscriber, TranscriptionSummary
+from ..asr import FasterWhisperTranscriber, TranscriptionError, TranscriptionSummary
 from ..exporting import (
     ExportPlan,
+    ExportError,
     export_clean_video,
     export_english_dub_video,
     export_english_subtitle_video,
@@ -41,7 +42,7 @@ from ..providers.translation import (
     TranslationResult,
     create_translation_provider,
 )
-from ..providers.tts import create_tts_provider
+from ..providers.tts import TTSProviderError, create_tts_provider
 from ..settings import ASRSettings, AppSettings
 
 PROCESS_SUSPEND_RESUME = 0x0800
@@ -51,6 +52,13 @@ PROCESS_TERMINATE = 0x0001
 
 class BackgroundTaskCancelled(RuntimeError):
     """Raised when the user stops the current background task."""
+
+
+def _format_worker_error(task_name: str, exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        message = exc.__class__.__name__
+    return f"{task_name}失败：{message}"
 
 
 def _with_windows_process_handle(
@@ -352,8 +360,11 @@ class AnalysisWorker(ControllableWorker):
         except BackgroundTaskCancelled as exc:
             self.cancelled.emit(str(exc))
             return
+        except TranscriptionError as exc:
+            self.error.emit(_format_worker_error("字幕识别", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("字幕识别", exc))
             return
 
         self.finished.emit(
@@ -583,8 +594,11 @@ class ExportWorker(ControllableWorker):
         except BackgroundTaskCancelled as exc:
             self.cancelled.emit(str(exc))
             return
+        except (ExportError, TTSProviderError, TranslationProviderError, RuntimeError) as exc:
+            self.error.emit(_format_worker_error(self.task_label, exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error(self.task_label, exc))
             return
         self.finished.emit(ExportResult(export_type=self.export_type, plan=plan))
 
@@ -660,8 +674,11 @@ class DubbingWorker(ControllableWorker):
         except BackgroundTaskCancelled as exc:
             self.cancelled.emit(str(exc))
             return
+        except TTSProviderError as exc:
+            self.error.emit(_format_worker_error("配音生成", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("配音生成", exc))
             return
 
         self.finished.emit(DubbingJobResult(items=generated_items))
@@ -688,7 +705,10 @@ class SourceProofreadWorker(ControllableWorker):
 
     def _is_timeout_error(self, exc: Exception) -> bool:
         message = str(exc).strip().lower()
-        return any(marker in message for marker in ("timed out", "timeout", "璇诲彇瓒呮椂", "瓒呮椂"))
+        return any(
+            marker in message
+            for marker in ("timed out", "timeout", "读取超时", "超时", "璇诲彇瓒呮椂", "瓒呮椂")
+        )
 
     def _proofread_batch_with_fallback(
         self,
@@ -771,8 +791,11 @@ class SourceProofreadWorker(ControllableWorker):
         except BackgroundTaskCancelled as exc:
             self.cancelled.emit(str(exc))
             return
+        except TranslationProviderError as exc:
+            self.error.emit(_format_worker_error("中文字幕校正", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("中文字幕校正", exc))
             return
 
         self.finished.emit(corrected_count)
@@ -809,7 +832,10 @@ class TranslationWorker(ControllableWorker):
 
     def _is_timeout_error(self, exc: Exception) -> bool:
         message = str(exc).strip().lower()
-        return any(marker in message for marker in ("timed out", "timeout", "璇诲彇瓒呮椂", "瓒呮椂"))
+        return any(
+            marker in message
+            for marker in ("timed out", "timeout", "读取超时", "超时", "璇诲彇瓒呮椂", "瓒呮椂")
+        )
 
     def _translate_batch_with_fallback(
         self,
@@ -960,8 +986,11 @@ class TranslationWorker(ControllableWorker):
         except BackgroundTaskCancelled as exc:
             self.cancelled.emit(str(exc))
             return
+        except TranslationProviderError as exc:
+            self.error.emit(_format_worker_error("翻译任务", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("翻译任务", exc))
             return
 
         self.finished.emit(TranslationJobResult(items=translated_items))
@@ -1002,7 +1031,7 @@ class PptImportWorker(ControllableWorker):
                 progress_callback=self._emit_progress,
             )
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("PPT 导入", exc))
             return
 
         self.finished.emit(PptImportJobResult(import_result=import_result))
@@ -1056,8 +1085,11 @@ class PptScriptGenerationWorker(ControllableWorker):
         except BackgroundTaskCancelled as exc:
             self.cancelled.emit(str(exc))
             return
+        except TranslationProviderError as exc:
+            self.error.emit(_format_worker_error("中文口播稿生成", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("中文口播稿生成", exc))
             return
 
         self.finished.emit(
@@ -1156,8 +1188,11 @@ class PptScriptTranslationWorker(ControllableWorker):
         except BackgroundTaskCancelled as exc:
             self.cancelled.emit(str(exc))
             return
+        except TranslationProviderError as exc:
+            self.error.emit(_format_worker_error("英文口播稿翻译", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("英文口播稿翻译", exc))
             return
 
         self.finished.emit(
@@ -1243,8 +1278,11 @@ class PptExportWorker(ExportWorker):
         except BackgroundTaskCancelled as exc:
             self.cancelled.emit(str(exc))
             return
+        except (ExportError, TTSProviderError, TranslationProviderError, RuntimeError) as exc:
+            self.error.emit(_format_worker_error("PPT 导出", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("PPT 导出", exc))
             return
 
         self.finished.emit(PptExportResult(plan=plan, project_snapshot=export_project))
@@ -1388,7 +1426,7 @@ class PptVoiceInputWorker(ControllableWorker):
                 raise RuntimeError("没有识别到可用的中文内容。")
             self._emit_progress(100, "语音识别完成。")
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("中文语音识别", exc))
             return
 
         self.finished.emit(
@@ -1438,8 +1476,11 @@ class VoicePreviewWorker(ControllableWorker):
                 output_path,
                 controller=self,
             )
+        except TTSProviderError as exc:
+            self.error.emit(_format_worker_error("音色试听", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("音色试听", exc))
             return
 
         self.finished.emit(
@@ -1465,7 +1506,10 @@ class TranslationTestWorker(ControllableWorker):
             self.progress.emit("正在测试翻译服务连接...")
             provider = create_translation_provider(self.settings.translation)
             sample = provider.test_connection()
+        except TranslationProviderError as exc:
+            self.error.emit(_format_worker_error("翻译配置测试", exc))
+            return
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(_format_worker_error("翻译配置测试", exc))
             return
         self.finished.emit(sample)

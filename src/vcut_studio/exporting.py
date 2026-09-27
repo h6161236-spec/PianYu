@@ -45,6 +45,12 @@ class DubAudioInput:
     cue: DubCue
     clip_path: Path
     clip_duration_ms: int
+    lead_silence_ms: int = 0
+    tail_silence_ms: int = 0
+
+    @property
+    def speech_duration_ms(self) -> int:
+        return max(0, self.clip_duration_ms - self.lead_silence_ms - self.tail_silence_ms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,6 +549,16 @@ def build_stretched_dub_cues(
         )
         if stretched_range is None:
             continue
+        speech_duration_ms = item.speech_duration_ms
+        if speech_duration_ms > 0 and item.clip_duration_ms > 0:
+            scale = stretched_range.duration_ms / float(item.clip_duration_ms)
+            adjusted_start_ms = stretched_range.start_ms + int(round(item.lead_silence_ms * scale))
+            adjusted_end_ms = stretched_range.end_ms - int(round(item.tail_silence_ms * scale))
+            if adjusted_end_ms - adjusted_start_ms >= max(80, min(400, speech_duration_ms // 4 or 80)):
+                stretched_range = TimeRange(
+                    start_ms=max(stretched_range.start_ms, adjusted_start_ms),
+                    end_ms=min(stretched_range.end_ms, adjusted_end_ms),
+                )
         stretched_cues.append(
             DubCue(
                 index=item.cue.index,
@@ -1349,6 +1365,83 @@ def wave_duration_ms(path: str | Path) -> int:
     return int(round((frame_count / frame_rate) * 1000))
 
 
+def detect_wave_silence_padding_ms(
+    path: str | Path,
+    *,
+    silence_threshold_ratio: float = 0.012,
+    min_consecutive_ms: int = 24,
+) -> tuple[int, int]:
+    with wave.open(str(path), "rb") as wav_file:
+        frame_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+        sample_width = wav_file.getsampwidth()
+        channel_count = wav_file.getnchannels()
+        raw_frames = wav_file.readframes(frame_count)
+
+    if frame_rate <= 0 or frame_count <= 0 or sample_width not in {1, 2, 4} or channel_count <= 0:
+        return (0, 0)
+
+    bytes_per_frame = sample_width * channel_count
+    if bytes_per_frame <= 0 or len(raw_frames) < bytes_per_frame:
+        return (0, 0)
+
+    if sample_width == 1:
+        peak_value = 127.0
+    elif sample_width == 2:
+        peak_value = 32767.0
+    else:
+        peak_value = 2147483647.0
+
+    silence_threshold = max(1.0, peak_value * max(0.0005, float(silence_threshold_ratio)))
+    min_consecutive_frames = max(1, int(frame_rate * max(0, int(min_consecutive_ms)) / 1000))
+
+    def _frame_peak(frame_bytes: bytes) -> float:
+        peak = 0.0
+        if sample_width == 1:
+            for index in range(0, len(frame_bytes), sample_width):
+                value = abs(frame_bytes[index] - 128)
+                if value > peak:
+                    peak = float(value)
+            return peak
+        if sample_width == 2:
+            for index in range(0, len(frame_bytes), sample_width):
+                value = abs(int.from_bytes(frame_bytes[index : index + 2], "little", signed=True))
+                if value > peak:
+                    peak = float(value)
+            return peak
+        for index in range(0, len(frame_bytes), sample_width):
+            value = abs(int.from_bytes(frame_bytes[index : index + 4], "little", signed=True))
+            if value > peak:
+                peak = float(value)
+        return peak
+
+    is_silent_frame: list[bool] = []
+    for frame_index in range(frame_count):
+        start = frame_index * bytes_per_frame
+        frame_bytes = raw_frames[start : start + bytes_per_frame]
+        is_silent_frame.append(_frame_peak(frame_bytes) <= silence_threshold)
+
+    lead_frames = 0
+    while lead_frames < frame_count and is_silent_frame[lead_frames]:
+        lead_frames += 1
+
+    tail_frames = 0
+    while tail_frames < frame_count and is_silent_frame[frame_count - 1 - tail_frames]:
+        tail_frames += 1
+
+    if lead_frames < min_consecutive_frames:
+        lead_frames = 0
+    if tail_frames < min_consecutive_frames:
+        tail_frames = 0
+    if lead_frames + tail_frames >= frame_count:
+        return (0, 0)
+
+    return (
+        int(round((lead_frames / frame_rate) * 1000)),
+        int(round((tail_frames / frame_rate) * 1000)),
+    )
+
+
 def build_atempo_filters(source_duration_ms: int, target_duration_ms: int) -> list[str]:
     if source_duration_ms <= 0 or target_duration_ms <= 0 or source_duration_ms <= target_duration_ms:
         return []
@@ -1416,11 +1509,14 @@ def prepare_english_dub_inputs(
                 controller=controller,
             )
         _controller_checkpoint(controller)
+        lead_silence_ms, tail_silence_ms = detect_wave_silence_padding_ms(clip_path)
         prepared_inputs.append(
             DubAudioInput(
                 cue=cue,
                 clip_path=Path(clip_path),
                 clip_duration_ms=wave_duration_ms(clip_path),
+                lead_silence_ms=lead_silence_ms,
+                tail_silence_ms=tail_silence_ms,
             )
         )
     return prepared_inputs

@@ -7,8 +7,10 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from vcut_studio.asr import TranscriptionError
 from vcut_studio.exporting import ExportPlan
 from vcut_studio.models import Project, SlidePage
+from vcut_studio.providers.tts import TTSProviderError
 from vcut_studio.providers.translation import (
     CorrectionResult,
     TranslationProviderError,
@@ -17,8 +19,10 @@ from vcut_studio.providers.translation import (
 )
 from vcut_studio.settings import AppSettings
 from vcut_studio.ui.workers import (
+    AnalysisWorker,
     BackgroundTaskCancelled,
     ControllableWorker,
+    DubbingWorker,
     PptExportWorker,
     SourceProofreadWorker,
     TranslationWorker,
@@ -197,6 +201,48 @@ class SourceProofreadWorkerTests(unittest.TestCase):
         self.assertEqual(results[0][1].source_text, "校正-seg1")
         self.assertEqual(results[1][1].source_text, "校正-seg2")
 
+class WorkerErrorFormattingTests(unittest.TestCase):
+    def test_analysis_worker_prefixes_transcription_error(self) -> None:
+        worker = AnalysisWorker("demo.wav", AppSettings().asr, None)
+        errors: list[str] = []
+        worker.error.connect(errors.append)
+
+        with patch("vcut_studio.ui.workers.FasterWhisperTranscriber") as transcriber_cls:
+            transcriber_cls.return_value.transcribe_media.side_effect = TranscriptionError("模型加载失败")
+            worker.run()
+
+        self.assertEqual(errors, ["字幕识别失败：模型加载失败"])
+
+    def test_dubbing_worker_prefixes_tts_error(self) -> None:
+        settings = AppSettings()
+        temp_root = _workspace_temp_dir("dubbing-worker-errors")
+        settings.workspace.workspace_dir = str(temp_root)
+        project = Project.new("Dub Errors")
+        project.segments = [
+            type(
+                "SegmentLike",
+                (),
+                {
+                    "en_text": "Hello",
+                    "voice_id": "emma_clear",
+                    "segment_id": "seg-1",
+                },
+            )()
+        ]
+        worker = DubbingWorker(project=project, settings=settings, row_indices=[0])
+        errors: list[str] = []
+        worker.error.connect(errors.append)
+
+        with patch("vcut_studio.ui.workers.create_tts_provider") as provider_factory:
+            provider_factory.return_value.synthesize_segment.side_effect = TTSProviderError("音色不可用")
+            worker.run()
+
+        try:
+            self.assertEqual(errors, ["配音生成失败：音色不可用"])
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
 class PptExportWorkerTests(unittest.TestCase):
     def test_ppt_export_worker_uses_project_snapshot_for_quick_export(self) -> None:
         project = Project.new("Deck", project_kind="ppt")
@@ -239,7 +285,7 @@ class PptExportWorkerTests(unittest.TestCase):
                 project.slides[0].actual_tts_duration_ms = 2300
                 return ExportPlan(cut_ranges=[], keep_ranges=[], output_path=output_path)
 
-            with patch("vcut_studio.ui.workers.export_ppt_voiceover_video", side_effect=_fake_export):
+            with patch.object(worker, "_run_export_in_subprocess", side_effect=lambda p, s: (_fake_export(p), p)):
                 worker.run()
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)

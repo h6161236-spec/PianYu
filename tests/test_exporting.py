@@ -19,6 +19,7 @@ from vcut_studio.exporting import (
     build_subtitle_cues_from_dub_cues,
     bilingual_subtitle_filter_expression,
     can_reuse_segment_dub,
+    detect_wave_silence_padding_ms,
     export_clean_video,
     export_english_dub_video,
     export_english_subtitle_video,
@@ -171,6 +172,35 @@ class ExportPlanningTests(unittest.TestCase):
         self.assertEqual(
             [(item.start_ms, item.end_ms, item.text) for item in stretched_cues],
             [(200, 1400, "Long English line")],
+        )
+
+    def test_build_stretched_dub_cues_trims_detected_lead_and_tail_silence(self) -> None:
+        cue = type(
+            "Cue",
+            (),
+            {
+                "index": 1,
+                "segment_index": 0,
+                "start_ms": 200,
+                "end_ms": 700,
+                "text": "Long English line",
+                "voice_id": "emma_clear",
+            },
+        )()
+        dub_inputs = [
+            DubAudioInput(
+                cue=cue,
+                clip_path=Path("demo.wav"),
+                clip_duration_ms=1200,
+                lead_silence_ms=100,
+                tail_silence_ms=200,
+            )
+        ]
+        timeline = build_dub_video_timeline(1000, dub_inputs)
+        stretched_cues = build_stretched_dub_cues(dub_inputs, timeline)
+        self.assertEqual(
+            [(item.start_ms, item.end_ms, item.text) for item in stretched_cues],
+            [(300, 1200, "Long English line")],
         )
 
     def test_build_subtitle_cues_from_dub_cues_uses_stretched_ranges(self) -> None:
@@ -341,6 +371,24 @@ class ExportPlanningTests(unittest.TestCase):
             self.assertIsNone(
                 can_reuse_segment_dub(segment, voice_id="emma_clear", rate=1.1, text="Hello")
             )
+
+    def test_detect_wave_silence_padding_ms_finds_leading_and_trailing_silence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wav_path = Path(tmp_dir) / "silence_padding.wav"
+            sample_rate = 1000
+            frame_values = ([0] * 100) + ([14000] * 300) + ([0] * 200)
+            with wave.open(str(wav_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                frames = b"".join(
+                    int(value).to_bytes(2, "little", signed=True) for value in frame_values
+                )
+                wav_file.writeframes(frames)
+
+            lead_ms, tail_ms = detect_wave_silence_padding_ms(wav_path)
+
+        self.assertEqual((lead_ms, tail_ms), (100, 200))
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for export integration tests")
